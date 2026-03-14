@@ -312,7 +312,8 @@ class Server():
 
 if __name__ == "__main__":
     serv = Server("username", "nickname", "##channel", opper_nicknames = ["opperhere"])
-    serv.connect("tantalum.libera.chat", 6667, sock_recvbuf = 8192)
+    serv.connect("IP", 6667, sock_recvbuf = 8192)
+
 
     # Allow for the user to send raw IRC messages
     # These bypass the send queue
