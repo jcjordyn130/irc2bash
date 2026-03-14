@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import socket
 import signal
 import threading
@@ -61,16 +62,23 @@ class Server():
 
     # Gracefully shuts the server down
     def die(self, msg = "Python3 Server() outta here!"):
-        print("[SERVER/MAINTHREAD] Sending PART and QUIT")
+        # NOOP if we're in the process of going down
+        if self._going_down.is_set():
+            return
+
+        print("[SERVER] Sending PART and QUIT")
         # Part all of our channels with a cool message, then quit
         for channel in self.channels:
-            self._send_q.put(f"PART {channel} : {msg}\r\n".encode())
+            self.sock.send(f"PART {channel} : {msg}\r\n".encode())
 
-        self._send_q.put(f"QUIT : {msg}\r\n".encode())
+        self.sock.send(f"QUIT : {msg}\r\n".encode())
 
-        print("[SERVER/MAINTHREAD] Signaling threads to quit!")
+        print("[SERVER] Signaling threads to quit!")
         # Signal threads to quit
         self._going_down.set()
+
+        print("[SERVER] Signaling main thread to quit!")
+        os.kill(os.getpid(), signal.SIGINT)
 
     # Sends a message to a target (user/channel)
     # The bot does NOT have to be a channel to send a message, but most channels
@@ -118,8 +126,8 @@ class Server():
                 self.sock.send(msg)
             except BrokenPipeError:
                 # Can't use die because we have no connection... just quit I suppose
-                self._going_down.set()
-                raise SystemExit(1)
+                print("[SENDTHREAD] Quitting due to BrokenPipeError!")
+                break
 
         print("[SENDTHREAD] Quitting due to thread condition!")
 
@@ -278,9 +286,8 @@ class Server():
                     self.privmsg(msg["target_channel"], f"Bot PID: {os.getpid()}")
                 # Kill server
                 if "die" in msg["params"][-1]:
+                    # Tear down server
                     self.die()
-                    raise SystemExit(0)
-
                 # Send flooding statistics
                 if "floodstats" in msg["params"][-1]:
                     self.privmsg(msg["target_channel"], f"Sleep Time: {self._msg_time}")
@@ -298,7 +305,7 @@ class Server():
                 print(f"[RECVTHREAD] Joining channel by opper command from {msg['message_source']}!")
                 self._send_q.put(f"JOIN {msg['params'][-1]}\r\n".encode())
                 self.channels.append(msg["params"][-1])
-                
+
     # This is where we actually run the RCE commands and pipe the output
     # back to IRC.
     #
@@ -351,13 +358,13 @@ if __name__ == "__main__":
     # These bypass the send queue
     while True:
         try:
-            rawcmd = input()
-            serv.sock.send(f"{rawcmd}\r\n".encode())
+            if sys.stdin.isatty():
+                rawcmd = input()
+                serv.sock.send(f"{rawcmd}\r\n".encode())
+            else:
+                serv._going_down.wait()
         except KeyboardInterrupt:
             print("[MAINTHREAD] Interrupt receieved... server going down!")
             print("[MAINTHREAD] Could take up to 60 seconds for socket timeout!")
             serv.die()
             raise SystemExit(0)
-        except EOFError:
-            while True:
-                serv._going_down.wait()
