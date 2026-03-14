@@ -7,15 +7,16 @@ import subprocess
 import re
 import time
 import queue
+import config
 
 class Server():
     # Setup the IRC related things such as user details and prefixes
     # This function also sets up the threading events and queues
-    def __init__(self, realname, nickname, channel, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = []):
+    def __init__(self, realname, nickname, channels, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = []):
         print(f"[SERVER/MAINTHREAD] Using Server() on Python3 PID {os.getpid()}")
         self.realname = realname
         self.nickname = nickname
-        self.channel = channel
+        self.channels = channels
         self.opper_nicknames = opper_nicknames
 
         # Prefix for commands to execute
@@ -35,7 +36,7 @@ class Server():
         self._msg_time = 0
         self._msg_count = 0
 
-        print(f"[SERVER/MAINTHREAD] Using nickname {nickname} on {channel}!")
+        print(f"[SERVER/MAINTHREAD] Using nickname {nickname}!")
 
     # This function handles the socket bring up
     # Sets socket paramaters, and starts the send/recv threads
@@ -145,7 +146,10 @@ class Server():
     def _send_userreg(self):       
         self._msg_q.put(f"USER {self.realname} * * :{self.nickname}\r\n".encode())
         self._msg_q.put(f"NICK {self.nickname}\r\n".encode())
-        self._msg_q.put(f"JOIN {self.channel}\r\n".encode())
+
+        for channel in self.channels:
+            print(f"[RECVTHREAD] Joining channel {channel}!")
+            self._msg_q.put(f"JOIN {channel}\r\n".encode())
   
     # Used to strip ASCII control characters (such as terminal escape codes)
     # from text. Mainly to avoid unknown command errors from the IRC server.
@@ -318,9 +322,8 @@ class Server():
         self._msg_q.put(f"PRIVMSG {target_channel} :CMD {cmd} exited with returncode {proc.returncode}\r\n".encode())
 
 if __name__ == "__main__":
-    serv = Server("username", "nickname", "##channel", opper_nicknames = ["opperhere"])
-    serv.connect("IP", 6667, sock_recvbuf = 8192)
-
+    serv = Server(**config.user, **config.bot)
+    serv.connect(**config.server)
 
     # Allow for the user to send raw IRC messages
     # These bypass the send queue
