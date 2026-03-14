@@ -28,8 +28,8 @@ class Server():
         # Used to signal threads to shutdown
         self._going_down = threading.Event()
 
-        # Queue used for messages to send
-        self._msg_q = queue.Queue()
+        # Queue used for IRC server send() calls
+        self._send_q = queue.Queue()
 
         # Rate limiting variables
         # Used so it can be quired by IRC
@@ -64,19 +64,36 @@ class Server():
         print("[SERVER/MAINTHREAD] Sending PART and QUIT")
         # Part all of our channels with a cool message, then quit
         for channel in self.channels:
-            self._msg_q.put(f"PART {channel} : {msg}\r\n".encode())
+            self._send_q.put(f"PART {channel} : {msg}\r\n".encode())
 
-        self._msg_q.put(f"QUIT : {msg}\r\n".encode())
+        self._send_q.put(f"QUIT : {msg}\r\n".encode())
 
         print("[SERVER/MAINTHREAD] Signaling threads to quit!")
         # Signal threads to quit
         self._going_down.set()
 
+    # Sends a message to a target (user/channel)
+    # The bot does NOT have to be a channel to send a message, but most channels
+    # disallow messages from non-JOIN'ed users.
+    def privmsg(self, target, message, bypass_q = False):
+        # Check for send thread
+        try:
+            self._send_thread
+        except NameError:
+            raise RuntimeWarning("connect() must be called before this command is used!")
+
+        # format message
+        message = f"PRIVMSG {target} :{message}\r\n".encode()
+
+        if bypass_q:
+            self.sock.send(message)
+        else:
+            self._send_q.put(message)
+
     # Function used to send messages from the queue
     # Rate limiting is also implemented here
     def _send_loop(self, ip):
         while not self._going_down.is_set():
-            self._msg_count+=1
             self._msg_time = (0.15 * self._msg_count)**2
             print(f"[SENDTHREAD] Sleeping for {self._msg_time} seconds on message count {self._msg_count}")
             time.sleep(self._msg_time)
@@ -87,7 +104,11 @@ class Server():
 
             # Grab message and send it
             try:
-                msg = self._msg_q.get(timeout = 60)
+                msg = self._send_q.get(timeout = 60)
+
+                # Only increment the message count if we actually get a message,
+                # the server will PING us when it needs to.
+                self._msg_count+=1
             except queue.Empty:
                 # So the thread signaler works
                 continue
@@ -144,12 +165,12 @@ class Server():
     # This isn't in the recv thread as we need to run it twice
     # if the nick is in use.
     def _send_userreg(self):       
-        self._msg_q.put(f"USER {self.realname} * * :{self.nickname}\r\n".encode())
-        self._msg_q.put(f"NICK {self.nickname}\r\n".encode())
+        self._send_q.put(f"USER {self.realname} * * :{self.nickname}\r\n".encode())
+        self._send_q.put(f"NICK {self.nickname}\r\n".encode())
 
         for channel in self.channels:
             print(f"[RECVTHREAD] Joining channel {channel}!")
-            self._msg_q.put(f"JOIN {channel}\r\n".encode())
+            self._send_q.put(f"JOIN {channel}\r\n".encode())
   
     # Used to strip ASCII control characters (such as terminal escape codes)
     # from text. Mainly to avoid unknown command errors from the IRC server.
@@ -228,6 +249,11 @@ class Server():
         debug_msg = self._strip_control_chars(f"[RECVTHREAD] Got message from server! Message: {msg}")
         print(debug_msg)
 
+        # Handle PINGs from server
+        if msg["command"] == "PING":
+            self.sock.send(f"PONG {msg['params'][0]}\r\n".encode())
+            return 
+
         # Handle PRIVMSG
         if msg["command"] == "PRIVMSG":
             # Check for command prefix and run it if we got one
@@ -242,17 +268,13 @@ class Server():
 
                 # Run CMDTHREAD
                 threading.Thread(target = self._handle_command, args = (cmd, msg["target_channel"], )).start()
-
-            # Check for bot prefix
-            if msg["params"][-1].startswith(self.bot_prefix):
+            elif msg["params"][-1].startswith(self.bot_prefix):
                 # Send message queue size
                 if "sendq" in msg["params"][-1]:
-                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Send Queue Size: {self._msg_q.qsize()}\r\n".encode())
-
+                    self.privmsg(msg["target_channel"], f"Send Queue Size: {self._send_q.qsize()}")
                 # Send main PID
                 if "pid" in msg["params"][-1]:
-                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Bot PID: {os.getpid()}\r\n".encode())
-
+                    self.privmsg(msg["target_channel"], f"Bot PID: {os.getpid()}")
                 # Kill server
                 if "die" in msg["params"][-1]:
                     self.die()
@@ -260,22 +282,20 @@ class Server():
 
                 # Send flooding statistics
                 if "floodstats" in msg["params"][-1]:
-                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Sleep Time: {self._msg_time}\r\n".encode())
-                    self._msg_q.put(f"PRIVMSG {msg['target_channel']} :Message Count: {self._msg_count}\r\n".encode())
-
+                    self.privmsg(msg["target_channel"], f"Sleep Time: {self._msg_time}")
+                    self.privmsg(msg["target_channel"], f"Message Count: {self._msg_count}")
         # Handle nickname already in use by appending the PID
         # and resending user reg
-        if msg["command"] == "433":
+        elif msg["command"] == "433":
             self.nickname = f"{self.nickname}-{os.getpid()}"
 
             print(f"[RECVTHREAD] Nickname already in use! Using: {self.nickname}")
             self._send_userreg()
-
         # Allow users to add bots to channel, but only if it's me
-        if msg["command"] == "INVITE":
+        elif msg["command"] == "INVITE":
             if msg["message_source"] in self.opper_nicknames:
                 print(f"[RECVTHREAD] Joining channel by opper command from {msg['message_source']}!")
-                self._msg_q.put(f"JOIN {msg['params'][-1]}\r\n".encode())
+                self._send_q.put(f"JOIN {msg['params'][-1]}\r\n".encode())
 
     # This is where we actually run the RCE commands and pipe the output
     # back to IRC.
@@ -315,11 +335,11 @@ class Server():
             line = line.replace("\r\n", "")
             line = line.replace("\n", "")
 
-            self._msg_q.put(b"PRIVMSG " + target_channel.encode() + b" :" + line.encode() + b"\r\n")
+            self.privmsg(target_channel, line)
 
         # Wait is required to fetch exit code
         proc.wait()
-        self._msg_q.put(f"PRIVMSG {target_channel} :CMD {cmd} exited with returncode {proc.returncode}\r\n".encode())
+        self.privmsg(target_channel, f"CMD {cmd} exited with returncode {proc.returncode}")
 
 if __name__ == "__main__":
     serv = Server(**config.user, **config.bot)
