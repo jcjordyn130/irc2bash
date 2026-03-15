@@ -407,6 +407,7 @@ class Server():
         self.privmsg(msg["target_channel"], f"Message Count: {self._msg_count}")
 
     def _cmd_clearsendq(self, msg):
+        self.privmsg(msg["target_channel"], f"Clearing sendq of size {self._send_q.qsize()}", bypass_q = True)
         self._oneshot_thread(self._clear_sendq)
 
 if __name__ == "__main__":
