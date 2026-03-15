@@ -7,6 +7,7 @@ user = {
 server = {
 	"ip": "irc.serv.net",
 	"port": 6667,
+	"ssl": False
 	"sock_timeout": 60,
 	"sock_sendbuf": 512,
 	"sock_recvbuf": 512

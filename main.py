@@ -9,6 +9,7 @@ import re
 import time
 import queue
 import config
+import ssl as ssllib
 
 class Server():
     # Order of functions in Server():
@@ -50,9 +51,18 @@ class Server():
 
     # This function handles the socket bring up
     # Sets socket paramaters, and starts the send/recv threads
-    def connect(self, ip, port, sock_timeout = 60, sock_sendbuf = 512, sock_recvbuf = 512):
+    def connect(self, ip, port, ssl = False, sock_timeout = 60, sock_sendbuf = 512, sock_recvbuf = 512):
         print(f"[SERVER/MAINTHREAD] Connecting to {ip}:{port}")
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        if ssl:
+            print(f"[SERVER/MAINTHREAD] Using SSL for connection!")
+            context = ssllib.create_default_context()
+            self.sock = context.wrap_socket(sock, server_hostname = ip)
+        else:
+            print(f"[SERVER/MAINTHREAD] Using plain text for connection!")
+            self.sock = sock
 
         print(f"[SERVER/MAINTHREAD] Using socket timeout of {sock_timeout} seconds!")
         self.sock.settimeout(sock_sendbuf)
@@ -311,15 +321,21 @@ class Server():
             params.append(trailing)
 
         # Extract possible user info from prefix
-        if command in ["PRIVMSG", "INVITE"]:
+        if prefix:
             message_source = prefix.partition("!")[0]
 
             # Technically the target is ourselfs, but I change it to be the other user
             # so other parts of the script can easily use it to know where to send output.
-            if params[0] == self.nickname:
-                target_channel = message_source
-            else:
-                target_channel = params[0]
+            try:
+                if params[0] == self.nickname:
+                    target_channel = message_source
+                else:
+                    target_channel = params[0]
+            except IndexError:
+                # We got an empty command? what
+                # ZNC loves to send these
+                target_channel = None
+                
         else:
             message_source = None
             target_channel = None
@@ -345,6 +361,11 @@ class Server():
 
         # Handle PRIVMSG
         if msg["command"] == "PRIVMSG":
+            # Ignore empty PRIVMSGs, ZNC loves to send these.
+            if not len(msg["params"]):
+                print(f"[RECVTHREAD] Ignoring empty PRIVMSG from server!")
+                return
+
             # Check for command prefix and run it if we got one
             if msg["params"][-1].startswith(self.command_prefix):
                 # Strip command prefix and spaces if any from input
@@ -393,7 +414,11 @@ class Server():
                 print(f"[RECVTHREAD] Joining channel by opper command from {msg['message_source']}!")
                 self._send_q.put(f"JOIN {msg['params'][-1]}\r\n".encode())
                 self.channels.append(msg["params"][-1])
-
+        elif msg["command"] == "NICK":
+            # Somebody changed their nick, or the server forced us to change ours.
+            if msg["message_source"] == self.nickname:
+                print(f"[RECVTHREAD] Server forced nickname change to {msg['params'][0]}!")
+                self.nickname = msg["params"][0]
 
     # These are where bot commands are implemented
     # The format is _cmd_NAMEOFCOMMAND and it gets the class instance and the triggering message as parameters.
