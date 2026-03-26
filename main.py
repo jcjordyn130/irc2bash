@@ -148,6 +148,19 @@ class Server():
                 print("[SENDTHREAD] Quitting due to BrokenPipeError!")
                 break
 
+            # Parse message to see if we need to handle it
+            # This allows for "self-echo", aka the bot triggering itself
+            parsed = self._parse_message(msg.decode())
+            if parsed["command"] == "PRIVMSG":
+                print(f"[SENDTHREAD] The bot is sending a message... handling!")
+
+                # This is required because _parse_message does not detect self sent messages
+                # And adding it here was be the easiest.
+                parsed["message_source"] = self.nickname
+                parsed["target_channel"] = parsed["params"][0]
+
+                self._handle_message(parsed)
+                
         print("[SENDTHREAD] Quitting due to thread condition!")
 
     # This is the function used to process messages from the server
@@ -335,7 +348,6 @@ class Server():
                 # We got an empty command? what
                 # ZNC loves to send these
                 target_channel = None
-                
         else:
             message_source = None
             target_channel = None
