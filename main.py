@@ -99,9 +99,9 @@ class Server():
         print("[SERVER] Sending PART and QUIT")
         # Part all of our channels with a cool message, then quit
         for channel in self.channels:
-            self.sock.send(f"PART {channel} : {msg}\r\n".encode())
+            self.sock.send(f"PART {channel} :{msg}\r\n".encode())
 
-        self.sock.send(f"QUIT : {msg}\r\n".encode())
+        self.sock.send(f"QUIT :{msg}\r\n".encode())
 
         print("[SERVER] Signaling threads to quit!")
         # Signal threads to quit
@@ -580,7 +580,7 @@ class Server():
 
                 # Normalize case to avoid mistypes causing a command to not execute
                 command = command.lower()
-                
+
                 # Lookup command
                 try:
                     command_func = getattr(self, f"_cmd_{command}")
