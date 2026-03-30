@@ -403,15 +403,15 @@ class Server():
                 # Catch ANSI 256 Foreground: \x1b[38;5;<N>m
                 elif code == "38" and i + 2 < len(codes) and codes[i+1] == "5":
                     ansi_color = codes[i+2]
-                    if ansi_color in ANSI_256_TO_IRC_99:
-                        fg = ANSI_256_TO_IRC_99[ansi_color]
+                    if ansi_color in self._ascii_colors:
+                        fg = self._ascii_colors[ansi_color]
                     i += 2  # Skip the '5' and the '<N>' in the loop
                 
                 # Catch ANSI 256 Background: \x1b[48;5;<N>m
                 elif code == "48" and i + 2 < len(codes) and codes[i+1] == "5":
                     ansi_color = codes[i+2]
-                    if ansi_color in ANSI_256_TO_IRC_99:
-                        bg = ANSI_256_TO_IRC_99[ansi_color]
+                    if ansi_color in self._ascii_colors:
+                        bg = self._ascii_colors[ansi_color]
                     i += 2
                 
                 # Catch standard 16-color codes
