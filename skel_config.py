@@ -23,5 +23,8 @@ bot = {
 	"message_queue_max_size": 512,
 
 	# This is a config option because it can be quite heavy
-	"convert_ascii_colors": True
+	"convert_ascii_colors": True,
+
+	# Same with self-echo as it means ALL outgoing PRIVMSG's are ran through the message parser
+	"parse_self_messages": False
 }

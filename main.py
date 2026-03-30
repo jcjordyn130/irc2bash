@@ -21,7 +21,8 @@ class Server():
 
     # Setup the IRC related things such as user details and prefixes
     # This function also sets up the threading events and queues
-    def __init__(self, realname, nickname, channels, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = [], message_queue_max_size = 512, convert_ascii_colors = True):
+    def __init__(self, realname, nickname, channels, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = [], message_queue_max_size = 512, convert_ascii_colors = True,
+        parse_self_messages = False):
         print(f"[SERVER/MAINTHREAD] Using Server() on Python3 PID {os.getpid()}")
         self.realname = realname
         self.nickname = nickname
@@ -53,6 +54,9 @@ class Server():
         if convert_ascii_colors:
             print(f"[SERVER/MAINTHREAD] ASCII color interpretation is enabled... generating ASCII <-> IRC color mapping!")
             self._ascii_colors = self._generate_ascii_colors()
+
+        # Other tunables
+        self.parse_self_messages = parse_self_messages
 
         print(f"[SERVER/MAINTHREAD] Using nickname {nickname}!")
 
@@ -157,16 +161,17 @@ class Server():
 
             # Parse message to see if we need to handle it
             # This allows for "self-echo", aka the bot triggering itself
-            parsed = self._parse_message(msg.decode())
-            if parsed["command"] == "PRIVMSG":
-                print(f"[SENDTHREAD] The bot is sending a message... handling!")
+            if self.parse_self_messages:
+                parsed = self._parse_message(msg.decode())
+                if parsed["command"] == "PRIVMSG":
+                    print(f"[SENDTHREAD] The bot is sending a message... handling!")
 
-                # This is required because _parse_message does not detect self sent messages
-                # And adding it here was be the easiest.
-                parsed["message_source"] = self.nickname
-                parsed["target_channel"] = parsed["params"][0]
+                    # This is required because _parse_message does not detect self sent messages
+                    # And adding it here was be the easiest.
+                    parsed["message_source"] = self.nickname
+                    parsed["target_channel"] = parsed["params"][0]
 
-                self._handle_message(parsed)
+                    self._handle_message(parsed)
                 
         print("[SENDTHREAD] Quitting due to thread condition!")
 
