@@ -578,6 +578,9 @@ class Server():
                 if not command:
                     return
 
+                # Normalize case to avoid mistypes causing a command to not execute
+                command = command.lower()
+                
                 # Lookup command
                 try:
                     command_func = getattr(self, f"_cmd_{command}")
