@@ -10,6 +10,7 @@ import time
 import queue
 import config
 import ssl as ssllib
+import math
 
 class Server():
     # Order of functions in Server():
@@ -20,7 +21,7 @@ class Server():
 
     # Setup the IRC related things such as user details and prefixes
     # This function also sets up the threading events and queues
-    def __init__(self, realname, nickname, channels, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = [], message_queue_max_size = 512):
+    def __init__(self, realname, nickname, channels, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = [], message_queue_max_size = 512, convert_ascii_colors = True):
         print(f"[SERVER/MAINTHREAD] Using Server() on Python3 PID {os.getpid()}")
         self.realname = realname
         self.nickname = nickname
@@ -46,6 +47,12 @@ class Server():
         # Used so it can be quired by IRC
         self._msg_time = 0
         self._msg_count = 0
+
+        # Color support
+        self.convert_ascii_colors = convert_ascii_colors
+        if convert_ascii_colors:
+            print(f"[SERVER/MAINTHREAD] ASCII color interpretation is enabled... generating ASCII <-> IRC color mapping!")
+            self._ascii_colors = self._generate_ascii_colors()
 
         print(f"[SERVER/MAINTHREAD] Using nickname {nickname}!")
 
@@ -247,6 +254,11 @@ class Server():
             line = line.replace("\r\n", "")
             line = line.replace("\n", "")
 
+            # Replace color codes if enabled
+            if self.convert_ascii_colors:
+                print(f"[CMDTHREAD] Converting ASCII colors to IRC colors")
+                line = self._convert_color_escapes(line)
+
             self.privmsg(target_channel, line)
 
             # Break if our child exits for any reason
@@ -264,6 +276,165 @@ class Server():
             print(f"[RECVTHREAD] Joining channel {channel}!")
             self._send_q.put(f"JOIN {channel}\r\n".encode())
   
+    def _generate_ascii_colors(self):
+        # 1. Base 16 Colors (Standard ANSI mapped to classic mIRC palette)
+        ansi_to_irc = {
+            0: 1, 1: 5, 2: 3, 3: 7, 4: 2, 5: 6, 6: 10, 7: 15,
+            8: 14, 9: 4, 10: 9, 11: 8, 12: 12, 13: 13, 14: 11, 15: 0
+        }
+
+        # 2. Extended Colors 16-98
+        # Modern IRC clients use the exact same xterm palette for 16-98
+        for i in range(16, 99):
+            ansi_to_irc[i] = i
+
+        # --- Helper to calculate standard xterm-256 RGB values ---
+        def get_ansi_rgb(code: int) -> tuple:
+            if 16 <= code <= 231:
+                code -= 16
+                # xterm color cube uses specific non-linear steps
+                steps = [0, 95, 135, 175, 215, 255]
+                r = steps[code // 36]
+                g = steps[(code % 36) // 6]
+                b = steps[code % 6]
+                return (r, g, b)
+            elif code >= 232:
+                # 24 Grayscale steps
+                gray = 8 + (code - 232) * 10
+                return (gray, gray, gray)
+            return (0, 0, 0)
+
+        # Cache the RGB values of the IRC palette (0-98)
+        irc_palette_rgb = {i: get_ansi_rgb(i) for i in range(16, 99)}
+        
+        # Add standard IRC colors 0-15 to the palette for distance matching
+        irc_palette_rgb.update({
+            0: (255, 255, 255), 1: (0, 0, 0), 2: (0, 0, 127), 3: (0, 147, 0),
+            4: (255, 0, 0), 5: (127, 0, 0), 6: (156, 0, 156), 7: (252, 127, 0),
+            8: (255, 255, 0), 9: (0, 252, 0), 10: (0, 147, 147), 11: (0, 255, 255),
+            12: (0, 0, 252), 13: (255, 0, 255), 14: (127, 127, 127), 15: (210, 210, 210)
+        })
+
+        # 3. Downsample Colors 99-255 using Euclidean RGB distance
+        for ansi_code in range(99, 256):
+            ansi_r, ansi_g, ansi_b = get_ansi_rgb(ansi_code)
+            
+            closest_irc = None
+            min_distance = float("inf")
+            
+            for irc_code, (irc_r, irc_g, irc_b) in irc_palette_rgb.items():
+                # Calculate distance between the ANSI RGB and IRC RGB
+                distance = math.sqrt((ansi_r - irc_r)**2 + (ansi_g - irc_g)**2 + (ansi_b - irc_b)**2)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_irc = irc_code
+                    
+            ansi_to_irc[ansi_code] = closest_irc
+
+        # Return as a dictionary of zero-padded string mappings (e.g., {"196": "04"})
+        return {f"{k}": f"{v:02d}" for k, v in ansi_to_irc.items()}
+
+    # This is used to convert ASCII escape codes to IRC color codes
+    def _convert_color_escapes(self, text):
+        # If we are not set to convert, return the text unformatted.
+        # If we kept going, this code would cause an exception due to the class color mapping
+        # not being set.
+        if not self.convert_ascii_colors:
+            return text
+
+        # IRC Control Codes
+        IRC_COLOR = "\x03"
+        IRC_BOLD = "\x02"
+        IRC_ITALIC = "\x1d"
+        IRC_UNDERLINE = "\x1f"
+        IRC_RESET = "\x0f"
+
+        # Map ANSI foreground codes to two-digit IRC color codes
+        ANSI_FG = {
+            "30": "01", # Black
+            "31": "04", # Red
+            "32": "03", # Green
+            "33": "08", # Yellow
+            "34": "02", # Blue
+            "35": "06", # Magenta / Purple
+            "36": "10", # Cyan / Teal
+            "37": "15", # White / Light Gray
+            "90": "14", # Dark Gray
+            "91": "05", # Light Red / Maroon
+            "92": "09", # Light Green
+            "93": "08", # Light Yellow
+            "94": "12", # Light Blue
+            "95": "13", # Light Magenta / Pink
+            "96": "11", # Light Cyan
+            "97": "00", # Bright White
+        }
+
+        # Map ANSI background codes (4x and 10x) to IRC color codes
+        ANSI_BG = {f"{int(k) + 10}": v for k, v in ANSI_FG.items()}
+        ANSI_BG.update({f"{int(k) + 10}": v for k, v in ANSI_FG.items()})
+
+        # ANSI escape codes
+        ansi_regex = re.compile(r"\x1b\[([0-9;]*)m")
+
+        # This is the function that actually does the replacing
+        def replacer(match):
+            code_str = match.group(1)
+            if not code_str:
+                return IRC_RESET
+
+            codes = code_str.split(";")
+            result = ""
+            fg = None
+            bg = None
+
+            i = 0
+            while i < len(codes):
+                code = codes[i]
+                
+                if code == "0":
+                    result += IRC_RESET
+                elif code == "1":
+                    result += IRC_BOLD
+                elif code == "3":
+                    result += IRC_ITALIC
+                elif code == "4":
+                    result += IRC_UNDERLINE
+                
+                # Catch ANSI 256 Foreground: \x1b[38;5;<N>m
+                elif code == "38" and i + 2 < len(codes) and codes[i+1] == "5":
+                    ansi_color = codes[i+2]
+                    if ansi_color in ANSI_256_TO_IRC_99:
+                        fg = ANSI_256_TO_IRC_99[ansi_color]
+                    i += 2  # Skip the '5' and the '<N>' in the loop
+                
+                # Catch ANSI 256 Background: \x1b[48;5;<N>m
+                elif code == "48" and i + 2 < len(codes) and codes[i+1] == "5":
+                    ansi_color = codes[i+2]
+                    if ansi_color in ANSI_256_TO_IRC_99:
+                        bg = ANSI_256_TO_IRC_99[ansi_color]
+                    i += 2
+                
+                # Catch standard 16-color codes
+                elif code in ANSI_FG:
+                    fg = ANSI_FG[code]
+                elif code in ANSI_BG:
+                    bg = ANSI_BG[code]
+                    
+                i += 1
+
+            # Construct the final IRC formatting string
+            if fg and bg:
+                result += f"{IRC_COLOR}{fg},{bg}"
+            elif fg:
+                result += f"{IRC_COLOR}{fg}"
+            elif bg:
+                result += f"{IRC_COLOR},{bg}"
+
+            print(f"Replaced {code_str} with {result}")
+            return result
+
+        return ansi_regex.sub(replacer, text)
+
     # Used to strip ASCII control characters (such as terminal escape codes)
     # from text. Mainly to avoid unknown command errors from the IRC server.
     def _strip_control_chars(self, text):
