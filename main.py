@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import fcntl
 import os
+import struct
 import sys
 import socket
 import signal
+import termios
 import threading
 import subprocess
 import re
@@ -11,6 +14,7 @@ import queue
 import config
 import ssl as ssllib
 import math
+import pty
 
 class Server():
     # Order of functions in Server():
@@ -22,7 +26,7 @@ class Server():
     # Setup the IRC related things such as user details and prefixes
     # This function also sets up the threading events and queues
     def __init__(self, realname, nickname, channels, command_prefix = "$!", bot_prefix = "$$", opper_nicknames = [], message_queue_max_size = 512, convert_ascii_colors = True,
-        parse_self_messages = False):
+        parse_self_messages = False, pty_dimensions = [40, 512]):
         print(f"[SERVER/MAINTHREAD] Using Server() on Python3 PID {os.getpid()}")
         self.realname = realname
         self.nickname = nickname
@@ -57,6 +61,9 @@ class Server():
 
         # Other tunables
         self.parse_self_messages = parse_self_messages
+        self.pty_dimensions = pty_dimensions
+
+        self._ptys = []
 
         print(f"[SERVER/MAINTHREAD] Using nickname {nickname}!")
 
@@ -214,20 +221,52 @@ class Server():
         if self._going_down.is_set():
             print("[RECVTHREAD] Quitting due to thread condition!")
 
+    # This function  is used to create a virtual terminal with a specific
+    # set of dimensions.
+    def _create_pty(self, dims):
+        # Create a PTY
+        pty_master, pty_slave = os.openpty()
+
+        # Set PTY size
+        # ws_row, ws_col, ws_xpixel, ws_ypixel
+        # Pixel dimensions are 0 as those are rarely used.
+        winsize = struct.pack("HHHH", dims[0], dims[1], 0, 0)
+        fcntl.ioctl(pty_master, termios.TIOCSWINSZ, winsize)
+        
+        # Return file descriptor pair
+        return pty_master, pty_slave
+    
     # This is where we actually run the RCE commands and pipe the output
     # back to IRC.
     #
     # No temp files here
     def _handle_command(self, cmd, target_channel):
         print(f"[CMDTHREAD] Running CMD {cmd}!")
-        proc = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, stdin = subprocess.DEVNULL,
-        start_new_session=True, text=False)
-
         # Calculate maximum message size            
         # 512 bytes is max IRC message with <IRCv3 and no cap neg
         msg_without_data = b"PRIVMSG " + target_channel.encode() + b" :" + b"\r\n"
         max_data_len = 512 - len(msg_without_data)
         print(f"[CMDTHREAD] Reading from Popen pipe with len = {max_data_len}!")
+
+        # Set maximum line length
+        dims = self.pty_dimensions
+        if dims[1] > max_data_len:
+            print(f"[CMDTHREAD] Line length of {dims[1]} is over {max_data_len}, capping to {max_data_len - 5}!")
+            dims[1] = max_data_len
+
+        # Open PTY
+        pty_master, pty_slave = self._create_pty(dims)
+        pty_master_read = open(pty_master, "rb", closefd = False)
+
+        # Store master FD
+        self._ptys.append(pty_master)
+
+        # Actually run the command
+        proc = subprocess.Popen(cmd, shell = True, stdout = pty_slave, stderr = pty_slave, stdin = pty_slave,
+        start_new_session=True, text=False)
+
+        # Don't leave unneeded FDs open
+        os.close(pty_slave)
 
         while True:
             # Check for quitting flag
@@ -245,12 +284,26 @@ class Server():
 
             # Read a line up to max_data_len
             # Replace invalid chars with escape sequences
-            line = proc.stdout.readline(max_data_len)
+            try:
+                line = pty_master_read.readline(max_data_len * 2)
+            except OSError as e:
+                if e.errno == 5:
+                    print(f"[CMDTHREAD] Quitting due to PTY being closed!")
+                    break
+                else:
+                    raise
+
             line = line.decode("utf8", errors = "backslashreplace")
 
             # Check for empty data
             if not line:
                 break
+
+            # Replace color codes if enabled
+            if self.convert_ascii_colors:
+                print(f"[CMDTHREAD] Converting ASCII colors to IRC colors")
+                line = self._convert_color_escapes(line)
+                #line = self._strip_control_chars(line)
 
             # Remove carraige return to avoid confusing IRC server
             line = line.replace("\r", "")
@@ -259,16 +312,19 @@ class Server():
             line = line.replace("\r\n", "")
             line = line.replace("\n", "")
 
-            # Replace color codes if enabled
-            if self.convert_ascii_colors:
-                print(f"[CMDTHREAD] Converting ASCII colors to IRC colors")
-                line = self._convert_color_escapes(line)
-
             self.privmsg(target_channel, line)
 
             # Break if our child exits for any reason
             if proc.poll():
                 break
+
+        # Don't leave the PTY master open!
+        try:
+            self._ptys.remove(pty_master)
+        except ValueError:
+            print(f"[CMDTHREAD] PTY does not exist in self._ptys???")
+
+        os.close(pty_master)
 
     # This function sends the user details to the IRC server
     # This isn't in the recv thread as we need to run it twice
@@ -387,6 +443,7 @@ class Server():
             if not code_str:
                 return IRC_RESET
 
+            print(code_str)
             codes = code_str.split(";")
             result = ""
             fg = None
@@ -394,9 +451,12 @@ class Server():
 
             i = 0
             while i < len(codes):
+                print(f"Processing code: {codes[i]}!")
                 code = codes[i]
                 
                 if code == "0":
+                    result += IRC_RESET
+                elif code == "39" or code == "49":
                     result += IRC_RESET
                 elif code == "1":
                     result += IRC_BOLD
@@ -405,26 +465,42 @@ class Server():
                 elif code == "4":
                     result += IRC_UNDERLINE
                 
+                # Catch SGR Foreground: \x1b[38;2;{r};{g};{b}m
+                elif (i + 4 <= len(codes)) and code == "38" and codes[i+1] == "2" and int(codes[i+2]) <= 255 and int(codes[i+3]) <= 255 and int(codes[i+4]) <= 255:
+                    print("Got SGR fore")
+                    ansi_color = codes[i+2]
+                    if ansi_color in self._ascii_colors:
+                        fg = self._ascii_colors[ansi_color]
+                    i+=5
+
+                # Catch SGR Background: \x1b[48;2;{r};{g};{b}m
+                elif (i + 4 <= len(codes)) and code == "48" and codes[i+1] == "2" and int(codes[i+2]) <= 255 and int(codes[i+3]) <= 255 and int(codes[i+4]) <= 255:
+                    print("Got SGR back")
+                    ansi_color = codes[i+2]
+                    if ansi_color in self._ascii_colors:
+                        bg = self._ascii_colors[ansi_color]
+                    i+=5
+
                 # Catch ANSI 256 Foreground: \x1b[38;5;<N>m
-                elif code == "38" and i + 2 < len(codes) and codes[i+1] == "5":
+                elif code == "38" and i + 2 < len(codes) and codes[i+1] == "5": 
                     ansi_color = codes[i+2]
                     if ansi_color in self._ascii_colors:
                         fg = self._ascii_colors[ansi_color]
                     i += 2  # Skip the '5' and the '<N>' in the loop
-                
+
                 # Catch ANSI 256 Background: \x1b[48;5;<N>m
                 elif code == "48" and i + 2 < len(codes) and codes[i+1] == "5":
                     ansi_color = codes[i+2]
                     if ansi_color in self._ascii_colors:
                         bg = self._ascii_colors[ansi_color]
                     i += 2
-                
+
                 # Catch standard 16-color codes
                 elif code in ANSI_FG:
                     fg = ANSI_FG[code]
                 elif code in ANSI_BG:
                     bg = ANSI_BG[code]
-                    
+
                 i += 1
 
             # Construct the final IRC formatting string
@@ -435,7 +511,7 @@ class Server():
             elif bg:
                 result += f"{IRC_COLOR},{bg}"
 
-            print(f"Replaced {code_str} with {result}")
+            #print(f"Replaced {code_str} with {result}")
             return result
 
         return ansi_regex.sub(replacer, text)
@@ -569,14 +645,17 @@ class Server():
                 
             if msg["params"][-1].startswith(self.bot_prefix):
                 # Get rid of the bot prefix
-                command = msg["params"][-1].strip(self.bot_prefix)
+                command_str = msg["params"][-1].strip(self.bot_prefix)
 
                 # Get rid of any leading spaces
-                command = command.strip(" ")
+                command_str = command_str.strip(" ")
 
                 # Ignore blank commands
-                if not command:
+                if not command_str:
                     return
+
+                # Grab arguments
+                command, _, args = command_str.partition(" ")
 
                 # Normalize case to avoid mistypes causing a command to not execute
                 command = command.lower()
@@ -591,7 +670,7 @@ class Server():
 
                 # Run command
                 print(f"[RECVTHREAD] Running command _cmd_{command}!")
-                command_func(msg)
+                command_func(msg, args)
 
         # Handle nickname already in use by appending the PID
         # and resending user reg
@@ -613,37 +692,63 @@ class Server():
                 self.nickname = msg["params"][0]
 
     # These are where bot commands are implemented
-    # The format is _cmd_NAMEOFCOMMAND and it gets the class instance and the triggering message as parameters.
+    # The format is _cmd_NAMEOFCOMMAND and it gets the class instance, the triggering message, and any arguments as parameters.
     # The functions are looked up dynamically in _handle_message and executed.
-    def _cmd_help(self, msg):
+    def _cmd_help(self, msg, args):
         for line in [f"Current bot prefix: {self.bot_prefix}", f"Current RCE prefix: {self.command_prefix}"]:
             self.privmsg(msg["target_channel"], line)
 
-    def _cmd_sendqlen(self, msg):
+    def _cmd_sendqlen(self, msg, args):
         self.privmsg(msg["target_channel"], f"Send Queue Size: {self._send_q.qsize()}")
 
-    def _cmd_pid(self, msg):
+    def _cmd_pid(self, msg, args):
         self.privmsg(msg["target_channel"], f"Bot PID: {os.getpid()}")
 
-    def _cmd_die(self, msg):
+    def _cmd_die(self, msg, args):
         # Tear down server
         self.die()
 
-    def _cmd_floodstats(self, msg):
+    def _cmd_floodstats(self, msg, args):
         self.privmsg(msg["target_channel"], f"Sleep Time: {self._msg_time}")
         self.privmsg(msg["target_channel"], f"Message Count: {self._msg_count}")
 
-    def _cmd_clearsendq(self, msg):
+    def _cmd_clearsendq(self, msg, args):
         self.privmsg(msg["target_channel"], f"Clearing sendq of size {self._send_q.qsize()}", bypass_q = True)
         self._oneshot_thread(self._clear_sendq)
 
-    def _cmd_killcmd(self, msg):
+    def _cmd_killcmd(self, msg, args):
         print("[RECVTHREAD] Signaling CMDTHREAD(s) to kill their children!")
         self._kill_cmd.set()
 
         # Also clear the sendq as this command will typically be used when doing
         # something such as catting /dev/urandom
         self._oneshot_thread(self._clear_sendq)
+
+    def _cmd_ptylen(self, msg, args):
+        self.privmsg(msg["target_channel"], f"PTY List SIze: {len(self._ptys)}")
+
+    def _cmd_commcmd(self, msg, args):
+        # Grab arguments and the pty index
+        args = args.split(" ")
+        try:
+            idx = int(args.pop(0))
+        except ValueError:
+            self.privmsg(msg["target_channel"], "Index is not an integer!")
+            return
+        
+        print(f"[RECVTHREAD] Communicating with command {idx}!")
+
+        # Grab PTY
+        try:
+            pty_master = self._ptys[idx]
+        except IndexError:
+            self.privmsg(msg["target_channel"], f"Command {idx} not found!")
+            return
+        
+        # Communicate
+        pty_master_write = open(pty_master, "wb", closefd = False)
+        data = "".join(args)
+        pty_master_write.write(data.encode())
 
 if __name__ == "__main__":
     serv = Server(**config.user, **config.bot)
